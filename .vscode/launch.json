@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "TestCalib",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${command:python.interpreterPath}",
+            "program": "/home/dji/workspace/QuadCalib/TestCalib.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "FixBug",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${command:python.interpreterPath}",
+            "program": "/home/dji/workspace/QuadCalib/FixBug.py",
+            "console": "integratedTerminal"
+        }
+    ]
+}
