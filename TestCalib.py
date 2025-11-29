@@ -5,7 +5,7 @@ from AprilDetection.detection import Detector
 from Calibrator.calibrator import IntrinsicCalibrator
 from AprilDetection.aprilgrid import generate_aprilgrid_3d_points, load_aprilgrid_config
 
-def RefineCalibration(valid_detection_result, rvecs, tvecs, K, xi, D, sub_pix_window_size, valid_detected_images):
+def RefineCalibration(valid_detection_result, rvecs, tvecs, K, xi, D, sub_pix_window_size, valid_detected_images, visualize=False):
     image_index = 0
     for det_result, r, t, img in zip(valid_detection_result, rvecs, tvecs, valid_detected_images):
     # cv2.imshow("Image", img)
@@ -96,8 +96,9 @@ def RefineCalibration(valid_detection_result, rvecs, tvecs, K, xi, D, sub_pix_wi
                 for point in det_point:
                     cv2.circle(raw_image, (int(point[0][0]), int(point[0][1])), 5, (0, 0, 255), -1)
         
-        cv2.imshow("Image", raw_image)
-        cv2.waitKey(500)
+        if visualize:
+            cv2.imshow("Image", raw_image)
+            cv2.waitKey(500)
         # save image
         image_name = format(image_index, '06d')
         image_name = image_name + ".jpg"
@@ -112,8 +113,8 @@ def RefineCalibration(valid_detection_result, rvecs, tvecs, K, xi, D, sub_pix_wi
 
 
 if __name__ == "__main__":
-    file_path = "/home/dji/workspace/QuadCalib/data/CAM_A"
-    april_tag_yaml = "/home/dji/workspace/QuadCalib/april_6x6.yaml"
+    file_path = "/home/nvidia/workspace/MultiCameraCalibration/20251128_173034_582/cam0"
+    april_tag_yaml = "/home/nvidia/workspace/MultiCameraCalibration/april_6x6.yaml"
     detector = Detector(camera_id=0, tag_config="tag36h11", minimum_tag_num=4, yaml_file=april_tag_yaml)
     images = os.listdir(file_path)
     
@@ -184,9 +185,9 @@ if __name__ == "__main__":
     points_3d = []
     
     #debug
-    f = open("/home/dji/workspace/QuadCalib/debug.txt", "w")
+    f = open("/home/nvidia/workspace/MultiCameraCalibration/debug.txt", "w")
     
-    detect_image_dir = "/home/dji/workspace/QuadCalib/data/detected_data_remove_ooi_all_5x5_2_seq_iter_1"
+    detect_image_dir = "/home/nvidia/workspace/MultiCameraCalibration/detected_data_remove_ooi_all_5x5_2_seq_iter_1"
     if not os.path.exists(detect_image_dir):
         os.makedirs(detect_image_dir)
     points_2d, points_3d = RefineCalibration(valid_detection_result, rvecs, tvecs, K, xi, D, 5, valid_detected_images)
@@ -199,7 +200,7 @@ if __name__ == "__main__":
     points_2d= []
     points_3d = []
 
-    detect_image_dir = "/home/dji/workspace/QuadCalib/data/detected_data_remove_ooi_all_5x5_2_seq_iter_2"
+    detect_image_dir = "/home/nvidia/workspace/MultiCameraCalibration/detected_data_remove_ooi_all_5x5_2_seq_iter_2"
     if not os.path.exists(detect_image_dir):
         os.makedirs(detect_image_dir)
     points_2d, points_3d = RefineCalibration(valid_detection_result, rvecs, tvecs, K, xi, D, 5, valid_detected_images)

@@ -35,7 +35,7 @@ import numpy as np
 import yaml
 import numpy as np
 from AprilDetection.aprilgrid import generate_aprilgrid_3d_points, load_aprilgrid_config
-from QuadUtils import K_xi_from_Intrinsic
+# from QuadUtils import K_xi_from_Intrinsic
 
 class Detector:               
     def __init__(self, camera_id = 0, tag_config="tag36h11", minimum_tag_num=4, 
@@ -47,7 +47,10 @@ class Detector:
         self.tag_config = tag_config
         self.detector_opencv = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         self.results = {}
-        arucoParams = cv2.aruco.DetectorParameters()
+        try:
+            arucoParams = cv2.aruco.DetectorParameters()
+        except AttributeError:
+            arucoParams = cv2.aruco.DetectorParameters_create()
         arucoParams.markerBorderBits = 2
         arucoParams.adaptiveThreshWinSizeStep = 1
         arucoParams.adaptiveThreshWinSizeMin = 3
@@ -59,18 +62,18 @@ class Detector:
                                                                 aprilgrid_config['tagRows'],
                                                                 aprilgrid_config['tagSize'],
                                                                 aprilgrid_config['tagSpacing'])
-        self.undist_before_detection = undist_before_detection
+        # self.undist_before_detection = undist_before_detection
         self.intrinsic_init = intrinsic_init
         self.D_init = D_init
-        if self.intrinsic_init is not None:
-            K, xi = K_xi_from_Intrinsic(self.intrinsic_init)
-        new_size = (2000, 1000)
-        Knew = np.array([[new_size[0]/5, 0.0, 0.0],
-                        [0.0, new_size[0]/5, 0.0],
-                        [0.0, 0.0, 1.0]], dtype=np.float64)
-        if self.undist_before_detection:
-            self.map1, self.map2 = cv2.omnidir.initUndistortRectifyMap(K, self.D_init, xi, np.eye(3),
-                                                                   Knew, new_size, cv2.CV_16SC2, cv2.omnidir.RECTIFY_CYLINDRICAL)
+        # if self.intrinsic_init is not None:
+        #     K, xi = K_xi_from_Intrinsic(self.intrinsic_init)
+        # new_size = (2000, 1000)
+        # Knew = np.array([[new_size[0]/5, 0.0, 0.0],
+        #                 [0.0, new_size[0]/5, 0.0],
+        #                 [0.0, 0.0, 1.0]], dtype=np.float64)
+        # if self.undist_before_detection:
+        #     self.map1, self.map2 = cv2.omnidir.initUndistortRectifyMap(K, self.D_init, xi, np.eye(3),
+        #                                                            Knew, new_size, cv2.CV_16SC2, cv2.omnidir.RECTIFY_CYLINDRICAL)
     
     def detect_subpix_corner(self, image_gray, marker_corners):
         markers_corners_subpixes = []
@@ -89,8 +92,8 @@ class Detector:
             image_gray = image
         # cv2.imwrite(f"data/image_{image_idx}_{self.camera_id}.png", image_gray)
         #And then use opencv
-        if self.undist_before_detection:
-            image_gray = cv2.remap(image_gray, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
+        # if self.undist_before_detection:
+        #     image_gray = cv2.remap(image_gray, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
         marker_corners, ids, rejectedImgPoints = cv2.aruco.detectMarkers(image_gray, self.detector_opencv,
                                                                 parameters=self.arucoParams)
         if enable_subpix:
@@ -115,13 +118,23 @@ class Detector:
                 
         return image, self.image_accumulate_corners
 
-    def gather_information(self):
+    def gather_information(self, selected_indices=None):
         # Output 3D points and 2D points
         # objectPoints	vector of vectors of calibration pattern points in the calibration pattern coordinate space.
         # imagePoints	vector of vectors of the projections of calibration pattern points. imagePoints.size() and objectPoints.size() and imagePoints[i].size() must be equal to objectPoints[i].size() for each i.
         objectPoints = []
         imagePoints = []
-        for image_idx, (image_t, corners, ids) in self.results.items():
+
+        if selected_indices is None:
+            items = self.results.items()
+        else:
+            # 只使用指定索引对应的帧
+            items = []
+            for image_idx in selected_indices:
+                if image_idx in self.results:
+                    items.append((image_idx, self.results[image_idx]))
+
+        for image_idx, (image_t, corners, ids) in items:
             objectPointsInFrame = []
             imagePointsInFrame = []
             if len(corners) < self.minimum_tag_num:
