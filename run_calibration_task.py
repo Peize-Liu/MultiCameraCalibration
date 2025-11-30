@@ -4,16 +4,11 @@ import argparse
 import yaml
 import cv2
 import numpy as np
+from tqdm import tqdm
+from scipy.optimize import least_squares
 
 from AprilDetection.detection import Detector
 from Calibrator.calibrator import IntrinsicCalibrator
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(x, *args, **kwargs):
-        return x
-
 
 def load_task_config(cfg_path: str):
     with open(cfg_path, "r") as f:
@@ -31,11 +26,18 @@ class CoverageTracker:
         self.down = max(1, int(grid_downsample))
         self.h = h // self.down
         self.w = w // self.down
+        # store original image size for visualization
+        self.full_h = h
+        self.full_w = w
+        # boolean mask on the downsampled grid indicating covered area
         self.cover_mask = np.zeros((self.h, self.w), dtype=bool)
 
     def _rasterize_polygon(self, poly_pts: np.ndarray) -> np.ndarray:
         """
-        将像素坐标多边形栅格化到下采样网格上，返回 bool mask。
+        Rasterize a polygon given in pixel coordinates onto the downsampled grid.
+
+        Returns:
+            A bool mask on the downsampled grid indicating the polygon area.
         """
         if poly_pts is None or len(poly_pts) < 3:
             return np.zeros_like(self.cover_mask, dtype=bool)
@@ -46,12 +48,12 @@ class CoverageTracker:
 
     def update_and_check(self, poly_pts: np.ndarray, added_ratio_thresh: float):
         """
-        更新覆盖并判断该帧是否带来足够新的覆盖区域。
+        Update coverage with the current frame and decide whether to accept it.
 
         Returns:
-            added_ratio: 本帧新增区域占本帧棋盘区域的比例
-            global_ratio: 全局覆盖比例（相对于整幅图）
-            accept: 是否接受该帧
+            added_ratio: ratio of newly covered area w.r.t. the board area in this frame
+            global_ratio: global coverage ratio w.r.t. the whole image
+            accept: whether this frame is accepted by the coverage filter
         """
         frame_mask = self._rasterize_polygon(poly_pts)
         board_area = frame_mask.sum()
@@ -69,11 +71,33 @@ class CoverageTracker:
         global_ratio = float(self.cover_mask.mean())
         return added_ratio, global_ratio, accept
 
+    def save_coverage_image(self, out_path: str, upscale_to_full: bool = True):
+        """
+        Save a visualization image of the accumulated coverage mask.
+
+        Args:
+            out_path: where to save the visualization image.
+            upscale_to_full: if True, resize the downsampled mask back to full image size.
+        """
+        # convert bool mask to 0/255 uint8
+        img = (self.cover_mask.astype(np.uint8) * 255)
+        if upscale_to_full:
+            img = cv2.resize(
+                img,
+                (self.full_w, self.full_h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        # apply a colormap for better visualization
+        color = cv2.applyColorMap(img, cv2.COLORMAP_JET)
+        cv2.imwrite(out_path, color)
+
 
 def compute_board_polygon(marker_corners, ids):
     """
-    根据一帧的检测结果估计标定板在图像中的外接区域（像素多边形）。
-    简化实现：对所有 tag 角点做 convex hull。
+    Estimate the outer polygon of the calibration board in the image
+    from the detected tag corners of a single frame.
+
+    Simplified implementation: compute a convex hull over all tag corners.
     """
     if marker_corners is None or len(marker_corners) == 0:
         return None
@@ -99,11 +123,11 @@ def calibrate_single_camera(cam_cfg: dict,
     sub_pix_predict = cam_cfg.get("sub_pix_predict", False)
 
     if img_dir is None:
-        raise ValueError(f"camera_id={cam_id} 的 image_path 未配置")
+        raise ValueError(f"camera_id={cam_id}: image_path is not configured.")
     if not os.path.isdir(img_dir):
-        raise FileNotFoundError(f"camera_id={cam_id} 的图像目录不存在: {img_dir}")
+        raise FileNotFoundError(f"camera_id={cam_id}: image directory does not exist: {img_dir}")
 
-    # AprilTag 检测器
+    # AprilTag detector
     detector = Detector(
         camera_id=cam_id,
         tag_config="tag36h11",
@@ -111,32 +135,32 @@ def calibrate_single_camera(cam_cfg: dict,
         yaml_file=tag_yaml,
     )
 
-    # 读取图像并进行角点检测
+    # read images and run tag detection
     image_files = sorted(
         f for f in os.listdir(img_dir)
         if f.lower().endswith((".jpg", ".png", ".jpeg", ".bmp"))
     )
 
     if not image_files:
-        raise RuntimeError(f"camera_id={cam_id} 在目录 {img_dir} 中没有找到图像")
+        raise RuntimeError(f"camera_id={cam_id}: no images found in directory {img_dir}")
 
     images = []
     shape = None
     img_idx = 0
-    for fname in tqdm(image_files, desc=f"Cam {cam_id} detect"):
+    for fname in tqdm(image_files, desc=f"camera {cam_id} tag detection"):
         img_path = os.path.join(img_dir, fname)
         img = cv2.imread(img_path)
         if img is None:
             continue
         if shape is None:
             shape = img.shape[:2]
-        # 这里默认开启亚像素角点（与 TestCalib 中的一致）
+        # always enable sub-pixel corner refinement here (consistent with TestCalib)
         _, _ = detector.detect(img, None, img_idx, show=False, enable_subpix=True)
         images.append(img)
         img_idx += 1
 
     if shape is None:
-        raise RuntimeError(f"camera_id={cam_id} 所有图像读取失败，无法标定")
+        raise RuntimeError(f"camera_id={cam_id}: all images failed to load, cannot calibrate.")
 
     h, w = shape
 
@@ -146,7 +170,7 @@ def calibrate_single_camera(cam_cfg: dict,
         "image_size": [w, h],
     }
 
-    # 覆盖筛选：根据 coverage_filter 配置决定是否启用
+    # coverage-based frame selection controlled by coverage_filter in the config
     coverage_enable = False
     added_ratio_thresh = 0.0
     grid_downsample = 1
@@ -158,38 +182,48 @@ def calibrate_single_camera(cam_cfg: dict,
     all_indices = sorted(detector.results.keys())
     used_indices = all_indices.copy()
     coverage_ratio = 0.0
+    coverage_tracker = None
 
     if coverage_enable and all_indices:
-        tracker = CoverageTracker(shape, grid_downsample=grid_downsample)
+        coverage_tracker = CoverageTracker(shape, grid_downsample=grid_downsample)
         used_indices = []
         for idx in all_indices:
             _, marker_corners, ids = detector.results[idx]
             poly = compute_board_polygon(marker_corners, ids)
-            added_ratio, coverage_ratio, accept = tracker.update_and_check(
+            added_ratio, coverage_ratio, accept = coverage_tracker.update_and_check(
                 poly, added_ratio_thresh
             )
             if accept:
                 used_indices.append(idx)
 
         if not used_indices:
-            # 如果全部被筛掉，为了保证可标定，退回使用全部帧
+            # if everything is filtered out, fall back to using all frames
             used_indices = all_indices
+
+        # save a coverage visualization image for this camera
+        coverage_img_path = os.path.join(
+            result_dir, f"camera_{cam_id}_coverage.png"
+        )
+        coverage_tracker.save_coverage_image(coverage_img_path)
+        print(
+            f"[Coverage] camera_id={cam_id}: coverage visualization saved to: {coverage_img_path}"
+        )
 
     total_frames = len(all_indices)
     used_frames = len(used_indices)
 
     if cam_model == "omni":
-        # 使用现有的 omnidir 单目标定器得到初始结果
+        # use the existing omnidir mono calibrator to get an initial solution
         calibrator = IntrinsicCalibrator()
         retval_init, K, xi, D, rvecs, tvecs, idx = calibrator.calibrate_mono(
             detector, (h, w), None, None, selected_indices=used_indices
         )
         if retval_init is None:
-            raise RuntimeError(f"camera_id={cam_id} 内参标定失败（点数不足）")
+            raise RuntimeError(f"camera_id={cam_id}: intrinsic calibration failed (insufficient points).")
 
         retval = float(retval_init)
 
-        # 如果开启 sub_pix_predict，则调用 refine_calibration 做两轮预测+亚像素优化+重标定
+        # if sub_pix_predict is enabled, run two rounds of refine_calibration + omnidir.recalibration
         if sub_pix_predict:
             detection_result = detector.results
             valid_detection_result = []
@@ -199,7 +233,7 @@ def calibrate_single_camera(cam_cfg: dict,
                 valid_detection_result.append(detection_result[i])
                 valid_detected_images.append(images[i])
 
-            # 进行两轮 refine_calibration + omnidir.calibrate
+            # run two rounds of refine_calibration + cv2.omnidir.calibrate
             for iter_idx in (1, 2):
                 debug_save_dir = None
                 visualize = False
@@ -253,11 +287,17 @@ def calibrate_single_camera(cam_cfg: dict,
         result["sub_pix_predict_used"] = bool(sub_pix_predict)
 
     elif cam_model == "pinhole":
-        # 标准针孔相机模型标定
-        obj_pts, img_pts = detector.gather_information()
+        # standard pinhole camera model calibration
+        # NOTE: reuse the coverage-filtered frame indices (used_indices) here.
+        # Otherwise, when there are many frames (hundreds or more), cv2.calibrateCamera
+        # may become extremely slow and look like it is "frozen".
+        obj_pts, img_pts = detector.gather_information(selected_indices=used_indices)
         if not obj_pts or not img_pts:
-            raise RuntimeError(f"camera_id={cam_id} 内参标定失败（点数不足）")
-        print("receive obj_pts and img_pts start to calibrate Camera Intrinsic should wait for a while")
+            raise RuntimeError(f"camera_id={cam_id}: intrinsic calibration failed (insufficient points).")
+        print(
+            f"camera_id={cam_id}: using {len(obj_pts)}/{total_frames} frames for pinhole intrinsic "
+            "calibration, calling cv2.calibrateCamera. This may take a while..."
+        )
         retval, K, D, rvecs, tvecs = cv2.calibrateCamera(
             obj_pts, img_pts, (w, h), None, None
         )
@@ -268,37 +308,340 @@ def calibrate_single_camera(cam_cfg: dict,
                 "D": D.reshape(-1).tolist(),
             }
         )
-        result["sub_pix_predict_used"] = False  # 当前只对 omni 做高级预测流程
+        # advanced prediction + refinement pipeline is only used for omni at the moment
+        result["sub_pix_predict_used"] = False
     else:
         raise ValueError(f"不支持的 camera_model: {cam_model}")
 
-    # 覆盖统计信息写入结果
+    # write coverage statistics into the result dict
     result["used_frames"] = int(used_frames)
     result["total_frames"] = int(total_frames)
     result["coverage_ratio"] = float(coverage_ratio)
     result["coverage_added_thresh"] = float(added_ratio_thresh)
     result["coverage_grid_downsample"] = int(grid_downsample)
 
-    # 保存结果
+    # save intrinsic result for this camera
     ensure_dir(result_dir)
     out_path = os.path.join(result_dir, f"camera_{cam_id}_intrinsic.yaml")
     with open(out_path, "w") as f:
         yaml.safe_dump(result, f)
-    print(f"[Intrinsic] camera_id={cam_id} 标定完成，结果已保存到: {out_path}")
+    print(f"[Intrinsic] camera_id={cam_id} finished. Result saved to: {out_path}")
+
+    # Return detector and intrinsic result for downstream extrinsic calibration
+    return detector, result
 
 
-def run_extrinsic_calibration(config: dict, result_dir: str):
+def _build_frame_points_from_detection(detector: Detector, frame_idx: int):
     """
-    外参标定占位函数（当前版本完全不做任何外参计算）。
+    Build per-frame 3D/2D point correspondences from Detector.results entry.
 
-    你的计划是：
-      1. 先用 PnP（solvePnP / omnidir.solvePnP）从共视 AprilGrid 帧估计每个相机的初始位姿；
-      2. 再构建非线性优化器，引入多相机之间的相对位姿约束和环路约束，联合优化外参。
-
-    为了先专注验证多相机内参标定和结果输出，本函数暂时留空。
-    后续实现外参时，可以在这里接入相机对、base_camera_id 和环路优化逻辑。
+    Returns:
+        obj_pts: (N, 3) array of AprilGrid 3D points in board frame.
+        img_pts: (N, 2) array of corresponding image points.
+        If the frame does not have enough tags, returns (None, None).
     """
-    return
+    if frame_idx not in detector.results:
+        return None, None
+    _, corners_list, ids = detector.results[frame_idx]
+    if len(corners_list) < detector.minimum_tag_num:
+        return None, None
+
+    obj_pts = []
+    img_pts = []
+    for corners, tag_id in zip(corners_list, ids):
+        # 3D corners in board frame
+        grid_pts = detector.aprilgrid_3d_points[tag_id[0]].reshape(-1, 3)
+        # 2D corners in image
+        corners_2d = corners.reshape(-1, 2)
+        obj_pts.extend(grid_pts)
+        img_pts.extend(corners_2d)
+
+    if not obj_pts or not img_pts:
+        return None, None
+
+    obj_pts = np.asarray(obj_pts, dtype=np.float32)
+    img_pts = np.asarray(img_pts, dtype=np.float32)
+    return obj_pts, img_pts
+
+
+def _se3_increment(xi: np.ndarray) -> np.ndarray:
+    """
+    Construct a small SE(3) increment from a 6D vector.
+
+    This is a simple left-multiplicative update:
+        T_inc = [ R(omega)  v ]
+                [    0      1 ]
+
+    where omega (first 3) is axis-angle, v (last 3) is translation in the
+    current camera frame. This is sufficient for numerical least-squares.
+    """
+    omega = xi[:3]
+    v = xi[3:]
+    theta = np.linalg.norm(omega)
+    if theta < 1e-12:
+        R_inc = np.eye(3, dtype=np.float64)
+    else:
+        R_inc, _ = cv2.Rodrigues(omega.reshape(3, 1))
+    T_inc = np.eye(4, dtype=np.float64)
+    T_inc[:3, :3] = R_inc
+    T_inc[:3, 3] = v.reshape(3)
+    return T_inc
+
+
+def _rt_to_T(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
+    """Convert OpenCV (rvec, tvec) to a 4x4 homogeneous transform."""
+    R, _ = cv2.Rodrigues(rvec)
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = tvec.reshape(3)
+    return T
+
+
+def run_extrinsic_calibration(
+    config: dict,
+    result_dir: str,
+    detectors: dict,
+    intrinsics: dict,
+):
+    """
+    Stereo extrinsic calibration using reprojection-error based bundle adjustment.
+
+    For each camera pair (ci, cj) in extrinsic_info.camera_pairs:
+      1. Find frames where both cameras have valid tag detections.
+      2. For the base camera (usually ci == base_camera_id), run PnP per frame
+         to estimate board pose T_ci_board^f.
+      3. For the paired camera, run PnP on at least one frame to obtain an
+         initial relative transform T_cj_ci (extrinsic).
+      4. Build a least-squares problem over:
+           - T_cj_ci (6D increment on SE(3))
+           - { T_ci_board^f } for all common frames (6D increment each)
+         minimizing the pixel reprojection error in both cameras.
+      5. Save the optimized extrinsic T_cj_ci to a YAML file.
+    """
+    extr_cfg = config.get("extrinsic_info", {})
+    if not extr_cfg.get("enable", False):
+        print("[Extrinsic] extrinsic_info.enable is False, skip extrinsic calibration.")
+        return
+
+    base_cam_id = int(extr_cfg.get("base_camera_id", 0))
+    cam_pairs = extr_cfg.get("camera_pairs", [])
+    if not cam_pairs:
+        print("[Extrinsic] No camera_pairs configured, skip extrinsic calibration.")
+        return
+
+    ensure_dir(result_dir)
+
+    for pair in cam_pairs:
+        if len(pair) != 2:
+            print(f"[Extrinsic] Invalid camera pair entry (expected length 2): {pair}")
+            continue
+
+        ci, cj = int(pair[0]), int(pair[1])
+        if ci not in detectors or cj not in detectors:
+            print(f"[Extrinsic] Missing detectors for camera pair ({ci}, {cj}), skip.")
+            continue
+        if ci not in intrinsics or cj not in intrinsics:
+            print(f"[Extrinsic] Missing intrinsics for camera pair ({ci}, {cj}), skip.")
+            continue
+
+        intr_i = intrinsics[ci]
+        intr_j = intrinsics[cj]
+        if intr_i.get("camera_model") != "pinhole" or intr_j.get("camera_model") != "pinhole":
+            print(
+                f"[Extrinsic] Only pinhole-pinhole pairs are supported for now. "
+                f"Pair ({ci}, {cj}) will be skipped."
+            )
+            continue
+
+        K_i = np.asarray(intr_i["K"], dtype=np.float64)
+        D_i = np.asarray(intr_i["D"], dtype=np.float64).reshape(-1, 1)
+        K_j = np.asarray(intr_j["K"], dtype=np.float64)
+        D_j = np.asarray(intr_j["D"], dtype=np.float64).reshape(-1, 1)
+
+        det_i = detectors[ci]
+        det_j = detectors[cj]
+
+        # build list of common frame indices where both cameras have valid detections
+        idx_i = set(det_i.results.keys())
+        idx_j = set(det_j.results.keys())
+        common_indices = sorted(idx_i & idx_j)
+        if not common_indices:
+            print(f"[Extrinsic] No common detection frames for pair ({ci}, {cj}), skip.")
+            continue
+
+        frames_data = []
+        for frame_idx in common_indices:
+            obj_i, img_i = _build_frame_points_from_detection(det_i, frame_idx)
+            obj_j, img_j = _build_frame_points_from_detection(det_j, frame_idx)
+            if obj_i is None or img_i is None or obj_j is None or img_j is None:
+                continue
+            if obj_i.shape[0] < 4 or obj_j.shape[0] < 4:
+                continue
+            frames_data.append(
+                {
+                    "frame_idx": frame_idx,
+                    "obj_i": obj_i,
+                    "img_i": img_i,
+                    "obj_j": obj_j,
+                    "img_j": img_j,
+                    # heuristic score: use min(#points_i, #points_j) so that
+                    # frames where both cameras see many tags are preferred
+                    "score": min(obj_i.shape[0], obj_j.shape[0]),
+                }
+            )
+
+        if not frames_data:
+            print(f"[Extrinsic] No usable common frames (with enough points) for pair ({ci}, {cj}), skip.")
+            continue
+
+        # optionally subsample best frames to limit problem size
+        max_frames = int(extr_cfg.get("max_frames", 80))
+        if len(frames_data) > max_frames:
+            # sort by score (descending), then take top max_frames
+            frames_data.sort(key=lambda f: f["score"], reverse=True)
+            frames_data = frames_data[:max_frames]
+            # keep frames ordered by frame index for readability
+            frames_data.sort(key=lambda f: f["frame_idx"])
+            print(
+                f"[Extrinsic] Pair ({ci}, {cj}): using top {max_frames} frames "
+                f"out of {len(common_indices)} common frames based on tag coverage."
+            )
+
+        # PnP to initialize board pose for base camera (we always treat ci as the base here)
+        for frame in frames_data:
+            obj = frame["obj_i"].reshape(-1, 1, 3)
+            img = frame["img_i"].reshape(-1, 1, 2)
+            ok, rvec, tvec = cv2.solvePnP(obj, img, K_i, D_i, flags=cv2.SOLVEPNP_ITERATIVE)
+            if not ok:
+                raise RuntimeError(
+                    f"[Extrinsic] solvePnP failed for camera {ci}, frame {frame['frame_idx']}"
+                )
+            frame["T_ci_board_init"] = _rt_to_T(rvec, tvec)
+
+        # Use the first frame with valid detections in both cameras to initialize T_cj_ci
+        T_cj_ci_init = None
+        for frame in frames_data:
+            obj = frame["obj_j"].reshape(-1, 1, 3)
+            img = frame["img_j"].reshape(-1, 1, 2)
+            ok, rvec_j, tvec_j = cv2.solvePnP(obj, img, K_j, D_j, flags=cv2.SOLVEPNP_ITERATIVE)
+            if not ok:
+                continue
+            T_cj_board = _rt_to_T(rvec_j, tvec_j)
+            T_ci_board = frame["T_ci_board_init"]
+            T_cj_ci_init = T_cj_board @ np.linalg.inv(T_ci_board)
+            break
+
+        if T_cj_ci_init is None:
+            print(
+                f"[Extrinsic] Could not initialize T_{cj}_{ci} from PnP for pair ({ci}, {cj}), skip."
+            )
+            continue
+
+        num_frames = len(frames_data)
+        # parameter vector: [xi_cj_ci (6), xi_board_f0 (6), ..., xi_board_f{N-1} (6)]
+        x0 = np.zeros(6 * (1 + num_frames), dtype=np.float64)
+
+        def residual_func(x: np.ndarray) -> np.ndarray:
+            xi_ex = x[:6]
+            T_cj_ci = _se3_increment(xi_ex) @ T_cj_ci_init
+
+            residuals = []
+            for k, frame in enumerate(frames_data):
+                xi_f = x[6 + 6 * k : 6 + 6 * (k + 1)]
+                T_ci_board = _se3_increment(xi_f) @ frame["T_ci_board_init"]
+
+                # camera i (base of this pair)
+                R_ci = T_ci_board[:3, :3]
+                t_ci = T_ci_board[:3, 3]
+                rvec_ci, _ = cv2.Rodrigues(R_ci)
+                proj_i, _ = cv2.projectPoints(
+                    frame["obj_i"].reshape(-1, 1, 3),
+                    rvec_ci,
+                    t_ci.reshape(3, 1),
+                    K_i,
+                    D_i,
+                )
+                proj_i = proj_i.reshape(-1, 2)
+                err_i = (proj_i - frame["img_i"]).reshape(-1)
+                residuals.append(err_i)
+
+                # camera j
+                T_cj_board = T_cj_ci @ T_ci_board
+                R_cj = T_cj_board[:3, :3]
+                t_cj = T_cj_board[:3, 3]
+                rvec_cj, _ = cv2.Rodrigues(R_cj)
+                proj_j, _ = cv2.projectPoints(
+                    frame["obj_j"].reshape(-1, 1, 3),
+                    rvec_cj,
+                    t_cj.reshape(3, 1),
+                    K_j,
+                    D_j,
+                )
+                proj_j = proj_j.reshape(-1, 2)
+                err_j = (proj_j - frame["img_j"]).reshape(-1)
+                residuals.append(err_j)
+
+            if not residuals:
+                return np.zeros(0, dtype=np.float64)
+            return np.concatenate(residuals).astype(np.float64)
+
+        print(
+            f"[Extrinsic] Start optimizing pair ({ci}, {cj}) with {num_frames} common frames "
+            f"and {6 * (1 + num_frames)} parameters (numeric Jacobian, method='trf')."
+        )
+        # Use 'trf' instead of 'lm': MINPACK/LM has a 32-bit integer limit on m*n
+        # and will overflow for large problems (many frames × many points).
+        res = least_squares(
+            residual_func,
+            x0,
+            method="trf",
+            verbose=1,
+        )
+        xi_ex_opt = res.x[:6]
+        T_cj_ci_opt = _se3_increment(xi_ex_opt) @ T_cj_ci_init
+
+        R_cj_ci = T_cj_ci_opt[:3, :3]
+        t_cj_ci = T_cj_ci_opt[:3, 3]
+
+        # compute per-point reprojection error statistics at the optimum
+        r_opt = residual_func(res.x)
+        if r_opt.size > 0:
+            r_2d = r_opt.reshape(-1, 2)
+            per_point_err = np.linalg.norm(r_2d, axis=1)
+            err_mean = float(per_point_err.mean())
+            err_min = float(per_point_err.min())
+            err_max = float(per_point_err.max())
+            num_points = int(per_point_err.size)
+        else:
+            err_mean = err_min = err_max = 0.0
+            num_points = 0
+
+        out_ex_path = os.path.join(result_dir, f"stereo_{ci}_{cj}_extrinsic.yaml")
+        out_data = {
+            "base_camera_id": int(base_cam_id),
+            "pair": [int(ci), int(cj)],
+            "T_cj_ci": {
+                "R": R_cj_ci.tolist(),
+                "t": t_cj_ci.reshape(3).tolist(),
+            },
+            "optimization": {
+                "cost": float(res.cost),
+                "num_iterations": int(res.nfev),
+                "num_frames": int(num_frames),
+                "reprojection_error": {
+                    "mean": err_mean,
+                    "min": err_min,
+                    "max": err_max,
+                    "num_points": num_points,
+                },
+            },
+        }
+        with open(out_ex_path, "w") as f:
+            yaml.safe_dump(out_data, f)
+        print(
+            f"[Extrinsic] Pair ({ci}, {cj}) optimized. Result saved to: {out_ex_path} "
+            f"(mean err = {err_mean:.4f} px, max err = {err_max:.4f} px, {num_points} points)"
+        )
 
 
 def main():
@@ -309,20 +652,20 @@ def main():
         "-c",
         type=str,
         default=default_cfg,
-        help=f"标定任务配置文件路径（默认: {default_cfg}）",
+        help=f"Path to the calibration task config file (default: {default_cfg})",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="保存 sub-pixel 优化的调试图片到 ./debug/camera_id/ 下",
+        help="Save sub-pixel refinement debug images to ./debug/camera_id/",
     )
     args = parser.parse_args()
 
     config = load_task_config(args.config)
 
     tag_info = config.get("tag_info", {})
-    # 当前实现继续使用独立的 AprilGrid 配置文件（例如 april_6x6.yaml）
-    # 如果你希望完全由 tag_info 驱动，可以在 Detector 内部做进一步扩展。
+    # Currently we still use a separate AprilGrid YAML file (e.g. april_6x6.yaml).
+    # If you prefer a fully config-driven setup, Detector can be extended to use tag_info only.
     tag_yaml = os.path.join(
         os.path.dirname(__file__), "april_6x6.yaml"
     )
@@ -334,20 +677,25 @@ def main():
     cam_cfgs = config.get("camera_info", {}).get("cameras", [])
     coverage_cfg = config.get("coverage_filter", {})
     if not cam_cfgs:
-        raise RuntimeError("camera_info.cameras 列表为空，请在 calibration_task.yaml 中配置相机。")
+        raise RuntimeError("camera_info.cameras list is empty. Please configure cameras in calibration_task.yaml.")
 
-    # 逐路相机做内参标定
+    # run intrinsic calibration for each camera and keep detectors/intrinsics for extrinsic
+    detectors = {}
+    intrinsics = {}
     for cam_cfg in cam_cfgs:
-        calibrate_single_camera(
+        detector, intr = calibrate_single_camera(
             cam_cfg,
             tag_yaml,
             result_dir,
             verbose=args.verbose,
             coverage_cfg=coverage_cfg,
         )
+        cam_id = cam_cfg["camera_id"]
+        detectors[cam_id] = detector
+        intrinsics[cam_id] = intr
 
-    # 外参标定已按你的要求暂时完全关闭
-    # run_extrinsic_calibration(config, result_dir)
+    # run extrinsic calibration (stereo) if enabled in config
+    run_extrinsic_calibration(config, result_dir, detectors, intrinsics)
 
 
 if __name__ == "__main__":
