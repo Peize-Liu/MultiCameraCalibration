@@ -112,11 +112,163 @@ def compute_board_polygon(marker_corners, ids):
     return hull.reshape(-1, 2)
 
 
+def _save_detected_corner_order_debug(
+    out_path: str,
+    image: np.ndarray,
+    marker_corners,
+    ids,
+    max_tags: int = 6,
+):
+    """
+    Save a debug visualization to verify the 2D corner ordering returned by OpenCV.
+
+    It draws each detected tag with its 4 corners labeled 0..3.
+    This is useful when RMSE is unexpectedly high and you suspect a 2D/3D corner
+    order mismatch.
+    """
+    if image is None or marker_corners is None or ids is None:
+        return False
+    if len(marker_corners) == 0:
+        return False
+
+    vis = image.copy()
+    if vis.ndim == 2:
+        vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    n = min(int(len(marker_corners)), int(max_tags))
+    for k in range(n):
+        corners = marker_corners[k].reshape(-1, 2)
+        tag_id = int(ids[k][0]) if hasattr(ids[k], "__len__") else int(ids[k])
+        # draw polygon
+        pts_i32 = corners.astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(vis, [pts_i32], True, (0, 255, 0), 2)
+        # draw corner indices
+        for i, (x, y) in enumerate(corners):
+            cv2.circle(vis, (int(x), int(y)), 4, (0, 0, 255), -1)
+            cv2.putText(
+                vis,
+                f"{tag_id}:{i}",
+                (int(x) + 6, int(y) - 6),
+                font,
+                0.5,
+                (255, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+    ensure_dir(os.path.dirname(out_path))
+    cv2.imwrite(out_path, vis)
+    return True
+
+
+def _flatten_obj_img_points(obj_pts: np.ndarray, img_pts: np.ndarray):
+    """
+    Normalize object/image points shapes to:
+      obj: (N, 3) float64
+      img: (N, 2) float64
+    Accepts common OpenCV calibration shapes like (N,1,3), (N,3), (M,4,3) etc.
+    """
+    obj = np.asarray(obj_pts)
+    img = np.asarray(img_pts)
+    obj = obj.reshape(-1, 3).astype(np.float64)
+    img = img.reshape(-1, 2).astype(np.float64)
+    return obj, img
+
+
+def _summarize_reprojection_errors(e_all: np.ndarray) -> dict:
+    """
+    Summarize per-point reprojection errors (L2 in pixels).
+
+    Returns a dict containing robust percentiles in addition to mean/min/max.
+    """
+    e = np.asarray(e_all, dtype=np.float64).reshape(-1)
+    if e.size == 0:
+        return {
+            "mean": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "p50": 0.0,
+            "p90": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "num_points": 0,
+        }
+    return {
+        "mean": float(e.mean()),
+        "min": float(e.min()),
+        "max": float(e.max()),
+        "p50": float(np.percentile(e, 50)),
+        "p90": float(np.percentile(e, 90)),
+        "p95": float(np.percentile(e, 95)),
+        "p99": float(np.percentile(e, 99)),
+        "num_points": int(e.size),
+    }
+
+
+def _compute_reprojection_error_stats_pinhole(
+    obj_pts_list,
+    img_pts_list,
+    rvecs,
+    tvecs,
+    K: np.ndarray,
+    D: np.ndarray,
+):
+    """Return summary dict of per-point reprojection error (L2 in pixels)."""
+    errs_chunks = []
+    if obj_pts_list is None or img_pts_list is None:
+        return _summarize_reprojection_errors(np.zeros(0, dtype=np.float64))
+    for obj_pts, img_pts, rvec, tvec in zip(obj_pts_list, img_pts_list, rvecs, tvecs):
+        obj, img = _flatten_obj_img_points(obj_pts, img_pts)
+        proj, _ = cv2.projectPoints(obj.reshape(-1, 1, 3), rvec, tvec, K, D)
+        proj = proj.reshape(-1, 2)
+        e = np.linalg.norm(proj - img, axis=1)
+        errs_chunks.append(e)
+    if not errs_chunks:
+        return _summarize_reprojection_errors(np.zeros(0, dtype=np.float64))
+    e_all = np.concatenate(errs_chunks)
+    return _summarize_reprojection_errors(e_all)
+
+
+def _compute_reprojection_error_stats_omni(
+    obj_pts_list,
+    img_pts_list,
+    rvecs,
+    tvecs,
+    K: np.ndarray,
+    xi: float,
+    D: np.ndarray,
+):
+    """Return summary dict of per-point reprojection error (L2 in pixels)."""
+    errs_chunks = []
+    if obj_pts_list is None or img_pts_list is None:
+        return _summarize_reprojection_errors(np.zeros(0, dtype=np.float64))
+    xi_f = float(xi)
+    for obj_pts, img_pts, rvec, tvec in zip(obj_pts_list, img_pts_list, rvecs, tvecs):
+        obj, img = _flatten_obj_img_points(obj_pts, img_pts)
+        proj, _ = cv2.omnidir.projectPoints(
+            obj.reshape(-1, 1, 3),
+            rvec,
+            tvec,
+            K,
+            xi_f,
+            D,
+        )
+        proj = proj.reshape(-1, 2)
+        e = np.linalg.norm(proj - img, axis=1)
+        errs_chunks.append(e)
+    if not errs_chunks:
+        return _summarize_reprojection_errors(np.zeros(0, dtype=np.float64))
+    e_all = np.concatenate(errs_chunks)
+    return _summarize_reprojection_errors(e_all)
+
+
 def calibrate_single_camera(cam_cfg: dict,
                             tag_yaml: str,
                             result_dir: str,
                             verbose: bool = False,
-                            coverage_cfg: dict | None = None):
+                            coverage_cfg: dict | None = None,
+                            opencv_criteria: tuple | None = None):
     cam_id = cam_cfg["camera_id"]
     cam_model = cam_cfg.get("camera_model", "omni")
     img_dir = cam_cfg.get("image_path")
@@ -170,6 +322,16 @@ def calibrate_single_camera(cam_cfg: dict,
         "image_size": [w, h],
     }
 
+    # Save one debug image that labels 2D corner ordering (0..3) for a few tags.
+    # This helps verify 2D/3D correspondences when RMSE is abnormally high.
+    if verbose and detector.results:
+        first_idx = sorted(detector.results.keys())[0]
+        _, marker_corners, ids = detector.results[first_idx]
+        debug_path = os.path.join(result_dir, f"camera_{cam_id}_corner_order_debug.png")
+        ok = _save_detected_corner_order_debug(debug_path, images[first_idx], marker_corners, ids)
+        if ok:
+            print(f"[Debug] camera_id={cam_id}: corner order debug saved to: {debug_path}")
+
     # coverage-based frame selection controlled by coverage_filter in the config
     coverage_enable = False
     added_ratio_thresh = 0.0
@@ -212,9 +374,25 @@ def calibrate_single_camera(cam_cfg: dict,
     total_frames = len(all_indices)
     used_frames = len(used_indices)
 
+    # Allow per-camera override of OpenCV termination criteria, falling back to the
+    # globally provided `opencv_criteria` from the task config.
+    if isinstance(cam_cfg, dict):
+        oc = cam_cfg.get("opencv_criteria")
+        if isinstance(oc, dict):
+            max_iter = int(oc.get("max_iter", 0))
+            eps = float(oc.get("eps", 0.0))
+            if max_iter > 0 and eps > 0:
+                opencv_criteria = (
+                    cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                    max_iter,
+                    eps,
+                )
+
     if cam_model == "omni":
         # use the existing omnidir mono calibrator to get an initial solution
         calibrator = IntrinsicCalibrator()
+        # keep the exact data fed into OpenCV for later reprojection-error stats
+        pts_3d_init, pts_2d_init = detector.gather_information(selected_indices=used_indices)
         retval_init, K, xi, D, rvecs, tvecs, idx = calibrator.calibrate_mono(
             detector, (h, w), None, None, selected_indices=used_indices
         )
@@ -222,6 +400,15 @@ def calibrate_single_camera(cam_cfg: dict,
             raise RuntimeError(f"camera_id={cam_id}: intrinsic calibration failed (insufficient points).")
 
         retval = float(retval_init)
+        reproj_stats = _compute_reprojection_error_stats_omni(
+            pts_3d_init,
+            pts_2d_init,
+            rvecs,
+            tvecs,
+            np.asarray(K, dtype=np.float64),
+            float(xi[0]),
+            np.asarray(D, dtype=np.float64),
+        )
 
         # if sub_pix_predict is enabled, run two rounds of refine_calibration + omnidir.recalibration
         if sub_pix_predict:
@@ -266,13 +453,23 @@ def calibrate_single_camera(cam_cfg: dict,
                     xi,
                     D,
                     flags=flags,
-                    criteria=(
+                    criteria=opencv_criteria
+                    or (
                         cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
                         200,
                         1e-6,
                     ),
                 )
                 retval = float(retval_refine)
+                reproj_stats = _compute_reprojection_error_stats_omni(
+                    points_3d,
+                    points_2d,
+                    rvecs,
+                    tvecs,
+                    np.asarray(K, dtype=np.float64),
+                    float(xi[0]),
+                    np.asarray(D, dtype=np.float64),
+                )
 
         result.update(
             {
@@ -281,6 +478,7 @@ def calibrate_single_camera(cam_cfg: dict,
                 "K": K.tolist(),
                 "xi": float(xi[0]),
                 "D": D.reshape(-1).tolist(),
+                "reprojection_error": reproj_stats,
             }
         )
 
@@ -298,14 +496,30 @@ def calibrate_single_camera(cam_cfg: dict,
             f"camera_id={cam_id}: using {len(obj_pts)}/{total_frames} frames for pinhole intrinsic "
             "calibration, calling cv2.calibrateCamera. This may take a while..."
         )
+        # NOTE: OpenCV defaults to a relatively small number of iterations.
+        # If you suspect "early stopping", configure cam_cfg.opencv_criteria.
         retval, K, D, rvecs, tvecs = cv2.calibrateCamera(
-            obj_pts, img_pts, (w, h), None, None
+            obj_pts,
+            img_pts,
+            (w, h),
+            None,
+            None,
+            criteria=opencv_criteria,
+        )
+        reproj_stats = _compute_reprojection_error_stats_pinhole(
+            obj_pts,
+            img_pts,
+            rvecs,
+            tvecs,
+            np.asarray(K, dtype=np.float64),
+            np.asarray(D, dtype=np.float64),
         )
         result.update(
             {
                 "rmse": float(retval),
                 "K": K.tolist(),
                 "D": D.reshape(-1).tolist(),
+                "reprojection_error": reproj_stats,
             }
         )
         # advanced prediction + refinement pipeline is only used for omni at the moment
@@ -676,6 +890,22 @@ def main():
 
     cam_cfgs = config.get("camera_info", {}).get("cameras", [])
     coverage_cfg = config.get("coverage_filter", {})
+    # Global OpenCV termination criteria for calibration (optional)
+    # Example (top-level in YAML):
+    #   opencv_criteria:
+    #     max_iter: 500
+    #     eps: 1e-9
+    global_criteria = None
+    oc = config.get("opencv_criteria")
+    if isinstance(oc, dict):
+        max_iter = int(oc.get("max_iter", 0))
+        eps = float(oc.get("eps", 0.0))
+        if max_iter > 0 and eps > 0:
+            global_criteria = (
+                cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                max_iter,
+                eps,
+            )
     if not cam_cfgs:
         raise RuntimeError("camera_info.cameras list is empty. Please configure cameras in calibration_task.yaml.")
 
@@ -689,6 +919,7 @@ def main():
             result_dir,
             verbose=args.verbose,
             coverage_cfg=coverage_cfg,
+            opencv_criteria=global_criteria,
         )
         cam_id = cam_cfg["camera_id"]
         detectors[cam_id] = detector

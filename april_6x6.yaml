@@ -1,5 +1,5 @@
 target_type: 'aprilgrid'
 tagCols: 6
 tagRows: 6
-tagSize: 0.022
+tagSize: 0.055
 tagSpacing: 0.3 # this is a ratio of tagSize
