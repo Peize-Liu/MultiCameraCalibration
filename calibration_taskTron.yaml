@@ -6,36 +6,35 @@ tag_info:
   tagSpacing: 0.3 # this is a ratio of tagSize
 
 # 标定结果输出目录（会自动创建）
-result_path: /Users/xddcore/peize/MultiCameraCalibration/Tron
+result_path: /Users/xddcore/peize/MultiCameraCalibration/tron_stereo_results
 
 # 全局覆盖筛选配置（控制进入标定的帧）
 coverage_filter:
   enable: true              # 是否启用覆盖驱动的帧筛选
   added_ratio_thresh: 0.01  # 本帧相对自身棋盘区域的新覆盖比例小于该值则丢弃
-  grid_downsample: 2        # 覆盖统计下采样因子，2 表示按 2x2 像素一格
+  grid_downsample: 1        # 覆盖统计下采样因子，2 表示按 2x2 像素一格
 
 # 相机相关配置：可以配置多路相机
 camera_info:
   cameras:
     - camera_id: 0
       camera_model: 'pinhole'    # 'omni' or 'pinhole'
-      image_path: /Users/xddcore/peize/MultiCameraCalibration/test_data/20251229_145937/cam0     # 这里填：/home/nvidia/workspace/MultiCameraCalibration/20251128_173034_582/cam0
+      image_path: /Users/xddcore/peize/MultiCameraCalibration/test_data/tron_stereo/cam0     # 这里填：/home/nvidia/workspace/MultiCameraCalibration/20251128_173034_582/cam0
       sub_pix_predict: False  # 对 omni 相机：是否开启基于粗内参的预测 + 亚像素优化 + 重标定
     - camera_id: 1
       camera_model: 'pinhole'    # 'omni' or 'pinhole'
-      image_path: /Users/xddcore/peize/MultiCameraCalibration/test_data/20251229_145937/cam1        # 这里填：/home/nvidia/workspace/MultiCameraCalibration/20251128_173034_582/cam1
+      image_path: /Users/xddcore/peize/MultiCameraCalibration/test_data/tron_stereo/cam1       # 这里填：/home/nvidia/workspace/MultiCameraCalibration/20251128_173034_582/cam1
       sub_pix_predict: False  # 对 omni 相机：是否开启基于粗内参的预测 + 亚像素优化 + 重标定
 
 # 外参标定相关配置
 extrinsic_info:
-  enable: False               # true 开启相机间外参标定
+  enable: True               # true 开启相机间外参标定
   base_camera_id: 0           # 以哪一路相机为基准坐标系
+  method: opencv
   camera_pairs:               # 用户提供有共视的相机对
     - [0, 1]
   loop_optimization: false    # 多相机围成一圈时，可作为后续“环路约束”优化开启开关（暂未实现）
-  method: opencv              # 'opencv' or 'custom'
-  max_frames: 200
-  save_worst_frames: false    # true: 保存外参最差的若干帧可视化（左右图拼接）
+  save_worst_frames: true
   worst_k: 8
 opencv_criteria:
   max_iter: 500
@@ -50,8 +49,6 @@ reprojection_heatmap:
   save_worst_frames: true  # true: 额外保存误差最大的若干帧的投影对齐可视化
   worst_k: 8               # 保存多少帧
 
-# 模糊帧筛选（全局）：用 Laplacian 方差作为清晰度指标，低于阈值认为模糊
-# 建议先把 enable 打开，阈值从 50~200 试起（分辨率越高数值通常越大）
 blur_filter:
-  enable: false
+  enable: true
   laplacian_var_thresh: 100.0

@@ -1,0 +1,66 @@
+tag_info:
+  target_type: 'aprilgrid'
+  tagCols: 6
+  tagRows: 6
+  tagSize: 0.055
+  tagSpacing: 0.3
+
+# 输出目录（会自动创建）
+result_path: /Users/xddcore/peize/MultiCameraCalibration/bag_results
+
+# ROS2 bag 配置
+bag_info:
+  bag_path: /path/to/ros2_bag_folder_or_mcap
+  # storage_id: sqlite3   # 可选：rosbag2 storage id（不填则由 rosbags 自动推断）
+
+# 图像/相机配置：每个相机对应一个 topic
+camera_info:
+  cameras:
+    - camera_id: 0
+      camera_model: 'pinhole'   # 'pinhole' or 'omni'
+      image_topic: /cam0/image_raw
+      image_type: raw           # raw or compressed
+      # max_frames: 500          # 可选：最多读取多少帧
+      # stride: 1               # 可选：每隔多少帧取一帧
+    - camera_id: 1
+      camera_model: 'pinhole'
+      image_topic: /cam1/image_raw
+      image_type: raw
+
+# 覆盖筛选（与文件夹流程一致）
+coverage_filter:
+  enable: true
+  added_ratio_thresh: 0.01
+  grid_downsample: 1
+
+# （可选）OpenCV 迭代终止条件（全局）
+opencv_criteria:
+  max_iter: 500
+  eps: 1e-9
+
+# 外参标定：先做 camera_pairs，再做 imu
+extrinsic_info:
+  enable: true
+  base_camera_id: 0
+  method: opencv
+  # Timestamp-based pairing for stereo: match frames if |t0 - t1| <= tolerance
+  time_sync_tolerance_sec: 0.01
+  max_pairs: 300
+  save_worst_frames: true
+  worst_k: 8
+  camera_pairs:
+    - [0, 1]
+
+imu_info:
+  enable: true
+  imu_topic: /imu/data
+  base_camera_id: 0
+  # dt 估计（秒），定义为：t_cam ≈ t_imu + dt
+  estimate_dt: true
+  dt_init: 0.0
+  dt_bounds: [-0.2, 0.2]
+  # 外参（旋转）估计：R_cam_imu，使得 R_cam_delta ≈ R_cam_imu * R_imu_delta * R_cam_imu^T
+  estimate_rotation: true
+  # 最少使用多少个相机运动约束
+  min_pairs: 30
+
